@@ -1,3 +1,3 @@
-echo hello
-ls
-cat /TEST.TXT
+echo before
+no_such_cmd
+echo after

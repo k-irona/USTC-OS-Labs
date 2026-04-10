@@ -169,13 +169,80 @@ static int prepare_argv(char *line, char *argv[], int maxargs) {
  * 用法：runscript <脚本路径>
  */
 int main(int argc, char *argv[]) {
-    if (argc < 2) {
+    if (argc != 2) {    
         fprintf(2, "usage: runscript <script>\n");
         exit(1);
-    }
+    }//check for argument count
 
     const char *script = argv[1];
-    //TODO: 补充处理脚本的核心逻辑，注意使用上述定义的各项工具函数
+    int fd = open(script, O_RDONLY);//open script
+    if (fd < 0) {
+        fprintf(2, "runscript: open '%s' failed\n", script);
+        exit(1);
+    }//open failed
+
+    struct line_reader lr;
+    lr_init(&lr, fd);
+    char line[MAXLINE];
+    char path[MAXLINE];
+    char *cmdv[MAXARGS];//command vector
+    int lineno = 0;//the no. of line
+
+    for (;;) {
+        int r = lr_readline(&lr, line, sizeof(line));//read one line
+        if (r == 0) {
+            break;
+        }//read eof
+        lineno++;
+        if (r < 0) {
+            fprintf(2, "runscript: read script failed at line %d\n", lineno);
+            close(fd);
+            exit(1);
+        }//read failed
+
+        int argc2 = prepare_argv(line, cmdv, MAXARGS);//get command vector
+        if (argc2 < 0) {
+            fprintf(2, "runscript: parse failed at line %d\n", lineno);
+            close(fd);
+            exit(1);
+        }//parse failed (too many arguments)
+        if (argc2 == 0) {
+            continue;
+        }//no need to proceed
+
+        if (makepath(cmdv[0], path, sizeof(path)) < 0) {//turn 1st cmd to path
+            fprintf(2, "runscript: command too long at line %d\n", lineno);
+            close(fd);
+            exit(1);
+        }//buffer insufficient
+        cmdv[0] = path;
+
+        int pid = fork();//fork
+        if (pid < 0) {
+            fprintf(2, "runscript: fork failed at line %d\n", lineno);
+            close(fd);
+            exit(1);
+        }//fork failed
+        if (pid == 0) {
+            exec(path, cmdv);//exec
+            fprintf(2, "runscript: exec failed at line %d\n", lineno);
+            exit(1);
+        }//exec failed
+
+        int status = 0;
+        if (wait(&status) < 0) {//wait
+            fprintf(2, "runscript: wait failed at line %d\n", lineno);
+            close(fd);
+            exit(1);
+        }//wait failed
+        if (status != 0) {
+            fprintf(2, "runscript: command failed at line %d\n", lineno);
+            close(fd);
+            exit(1);
+        }//when command exit(1)
+    }
+
+    close(fd);
     
     exit(0);
 }
