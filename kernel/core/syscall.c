@@ -684,6 +684,24 @@ static uint64 sys_getcwd(void) {
     return 0;
 }
 
+static uint64 sys_ioctl(void) {
+    struct proc *p = myproc();
+    int fd = (int)p->trapframe->a0;
+    int cmd = (int)p->trapframe->a1;
+    uint64 arg = p->trapframe->a2;
+
+    if (fd < 0 || fd >= NOFILE) {
+        return (uint64)-1;
+    }
+
+    struct file *f = p->ofile[fd];
+    if (f == 0) {
+        return (uint64)-1;
+    }
+
+    return (uint64)fileioctl(f, cmd, arg);
+}
+
 
 
 static uint64 (*syscalls[])(void) = {
@@ -710,6 +728,7 @@ static uint64 (*syscalls[])(void) = {
     [SYS_link] = sys_link,
     [SYS_dup2] = sys_dup2,
     [SYS_getcwd] = sys_getcwd,
+    [SYS_ioctl] = sys_ioctl,
 };
 
 void syscall(void) {

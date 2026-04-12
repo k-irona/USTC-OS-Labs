@@ -106,3 +106,7 @@ int dup2(int oldfd, int newfd) {
 int getcwd(char *buf, int max) {
     return (int)__syscall(SYS_getcwd, (long)buf, max, 0);
 }
+
+int ioctl(int fd, int cmd, uint64 arg) {
+    return (int)__syscall(SYS_ioctl, fd, cmd, arg);
+}
