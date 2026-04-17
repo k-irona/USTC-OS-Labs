@@ -351,13 +351,18 @@ void ai_service_proc_exit(int pid) {
     aisvc.worker_pid = 0;
     for (int i = 0; i < AI_NREQ; i++) {
         struct ai_request *req = &aisvc.reqs[i];
-        if (req->state == AIREQ_RUNNING) {
+        if (ai_req_busy(req)) {
             req->err = -1;
             req->result_len = 0;
             req->state = AIREQ_FAILED;
             wakeup(req);
         }
+        aisvc.q[i] = -1;
     }
+    aisvc.qhead = 0;
+    aisvc.qtail = 0;
+    aisvc.qcount = 0;
+    wakeup(&aisvc);
     wakeup(&aisvc.qcount);
     release(&aisvc.lock);
 }
