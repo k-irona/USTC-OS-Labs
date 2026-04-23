@@ -110,8 +110,8 @@ static __attribute__((unused)) struct ai_request *ai_find_req_locked(int reqid, 
          * Only return the request when owner_pid matches req->owner_pid.
          * This is the core ownership check used by query()/wait().
          */
-        (void)owner_pid;
-        return req;
+        if (req->owner_pid == owner_pid) return req;
+        return 0;
     }
     return 0;
 }
@@ -224,7 +224,7 @@ void ai_service_init(void) {
 
 static int ai_service_enqueue_tokens(uint64 token_uva, int token_count, int predict_count, int *reqid_out) {
     struct proc *p = myproc();
-    if (p == 0 || p->pagetable == 0) {
+    if (p == 0 || p->pagetable == 0 || reqid_out == 0) {
         return -1;
     }
     if (token_count <= 0 || token_count > AI_MAX_TOKENS || predict_count <= 0 || predict_count > AI_MAX_PREDICT) {
@@ -252,10 +252,37 @@ static int ai_service_enqueue_tokens(uint64 token_uva, int token_count, int pred
      * 4. Push the request's slot index into the circular queue.
      * 5. Wake the worker sleeping on qcount and return the reqid.
      */
+    struct ai_request *req = 0;
+    while (true) {
+        if (!aisvc.worker_online) {
+            release(&aisvc.lock);
+            return -1;
+        } // check worker registered
+        req = ai_find_slot_locked();
+        if (req != 0) break; // found a free slot
+        sleep(&aisvc, &aisvc.lock); // sleep until aisvc was waken
+    }
 
+    req->id = aisvc.next_id++;
+    req->owner_pid = p->pid;
+    req->state = AIREQ_NEW;
+    req->err = 0;
+    req->token_count = token_count;
+    req->predict_count = predict_count;
+    req->result_len = 0;
+    memmove(req->tokens, tokens, (uint64)token_count * sizeof(uint32));
+    req->result[0] = '\0';
+    req->state = AIREQ_READY; // initialize
+
+    int slot_index = (int)(req - &aisvc.reqs[0]);
+    aisvc.q[aisvc.qtail] = slot_index;
+    aisvc.qtail = (aisvc.qtail + 1) % AI_NREQ;
+    aisvc.qcount++; // push to the queue
+
+    wakeup(&aisvc.qcount); // wake the worker sleeping on qcount
+    *reqid_out = req->id;
     release(&aisvc.lock);
-    (void)reqid_out;
-    return -1;
+    return req->id;
 }
 
 int ai_service_worker_register(void) {
@@ -271,6 +298,19 @@ int ai_service_worker_register(void) {
      * Register the calling process as the unique ai_daemon worker.
      * Reject the call if some other worker is already online.
      */
+
+    if (aisvc.worker_online == 0) {
+        aisvc.worker_pid = p->pid;
+        aisvc.worker_online = 1;
+        wakeup(&aisvc.qcount);
+        release(&aisvc.lock);
+        return 0;
+    } //first time register
+
+    if (aisvc.worker_pid == p->pid) {
+        release(&aisvc.lock);
+        return 0;
+    } //repeat register
 
     release(&aisvc.lock);
     return -1;
@@ -299,8 +339,66 @@ int ai_service_worker_get(uint64 token_uva, int token_cap, uint64 reqid_uva, uin
      * 9. Return token_count on success.
      */
 
+    while (true) {
+        if (!aisvc.worker_online || p->pid != aisvc.worker_pid) {
+            release(&aisvc.lock);
+            return -1;
+        } // check the caller is registered worker
+        if (aisvc.qcount > 0) break;
+        sleep(&aisvc.qcount, &aisvc.lock);  // sleep while queue is empty
+    }
+
+    int slot_index = aisvc.q[aisvc.qhead];
+    aisvc.q[aisvc.qhead] = -1;
+    aisvc.qhead = (aisvc.qhead + 1) % AI_NREQ;
+    aisvc.qcount--; // pop slot index from the queue
+
+    if (slot_index < 0 || slot_index >= AI_NREQ) {
+        release(&aisvc.lock);
+        return -1;
+    }
+
+    struct ai_request *req = &aisvc.reqs[slot_index];
+    if (req->state != AIREQ_READY) {
+        release(&aisvc.lock);
+        return -1;
+    }
+    req->state = AIREQ_RUNNING; // mark the req RUNNING
+
+    int reqid_k = req->id;
+    int token_count_k = req->token_count;
+    int predict_count_k = req->predict_count;
+    uint32 tokens_k[AI_MAX_TOKENS];
+    memset(tokens_k, 0, sizeof(tokens_k));
+    memmove(tokens_k, req->tokens, (uint64)token_count_k * sizeof(uint32)); // copy into kernal buffers
+
+    if (token_cap < token_count_k) {
+        req->err = -1;
+        req->result_len = 0;
+        req->state = AIREQ_FAILED;
+        wakeup(req);
+        release(&aisvc.lock);
+        return -1;
+    } // when token_cap is too small
+
     release(&aisvc.lock);
-    return -1;
+
+    if (copyout(p->pagetable, token_uva, (char *)tokens_k, (uint64)token_count_k * sizeof(uint32)) < 0 ||
+        copyout(p->pagetable, reqid_uva, (char *)&reqid_k, sizeof(reqid_k)) < 0 ||
+        copyout(p->pagetable, predict_uva, (char *)&predict_count_k, sizeof(predict_count_k)) < 0) {
+        acquire(&aisvc.lock);
+        struct ai_request *req2 = ai_find_req_by_id_locked(reqid_k);
+        if (req2 != 0 && req2->state == AIREQ_RUNNING) {
+            req2->err = -1;
+            req2->result_len = 0;
+            req2->state = AIREQ_FAILED;
+            wakeup(req2);
+        } // if copyout failed
+        release(&aisvc.lock);
+        return -1;
+    }
+
+    return token_count_k;
 }
 
 int ai_service_worker_complete(int reqid, uint64 out_uva, int out_len, int status) {
@@ -331,9 +429,58 @@ int ai_service_worker_complete(int reqid, uint64 out_uva, int out_len, int statu
      *      - move state to FAILED
      * 7. Wake up any process sleeping in ai_wait().
      */
+    if (!aisvc.worker_online || p->pid != aisvc.worker_pid) {
+        release(&aisvc.lock);
+        return -1;
+    } // check the caller is registered worker
+
+    struct ai_request *req = ai_find_req_by_id_locked(reqid);
+    if (req == 0 || req->state != AIREQ_RUNNING) {
+        release(&aisvc.lock);
+        return -1;
+    } // find RUNNING req
 
     release(&aisvc.lock);
-    return -1;
+
+    int request_failed = 0;
+    int fail_err = -1;
+    if (status != 0) {
+        request_failed = 1;
+        fail_err = status < 0 ? status : -1;
+    } else if (out_len < 0 || out_len > AI_MAX_RESULT) {
+        request_failed = 1;
+    } else if (out_len > 0 && copyin(p->pagetable, result, out_uva, (uint64)out_len) < 0) {
+        request_failed = 1;
+    } // check status, length and copyin while unlocked
+
+    acquire(&aisvc.lock); // reacquiring lock
+
+    struct ai_request *req2 = ai_find_req_by_id_locked(reqid);
+    if (req2 == 0 || req2->state != AIREQ_RUNNING) {
+        release(&aisvc.lock);
+        return -1;
+    } // re-check req failed
+
+    if (request_failed) {
+        req2->err = fail_err;
+        req2->result_len = 0;
+        req2->result[0] = '\0';
+        req2->state = AIREQ_FAILED;
+        wakeup(req2);
+        release(&aisvc.lock);
+        return -1;
+    } // previous fail
+
+    req2->err = 0;
+    req2->result_len = out_len;
+    if (out_len > 0) {
+        memmove(req2->result, result, (uint64)out_len);
+    }
+    req2->result[out_len] = '\0';
+    req2->state = AIREQ_DONE;
+    wakeup(req2);
+    release(&aisvc.lock);
+    return 0; // re-check success
 }
 
 void ai_service_proc_exit(int pid) {
@@ -388,8 +535,26 @@ int ai_service_query(int reqid, uint64 st_uva) {
      * 3. Fill a struct ai_status with reqid/state/err/result_len.
      * 4. copyout that status structure to st_uva.
      */
-    (void)st_uva;
-    return -1;
+    struct ai_status st;
+    memset(&st, 0, sizeof(st));
+
+    acquire(&aisvc.lock);
+    struct ai_request *req = ai_find_req_locked(reqid, p->pid); // find req
+    if (req == 0) {
+        release(&aisvc.lock);
+        return -1;
+    } // refuse to expose status
+
+    st.reqid = req->id;
+    st.state = req->state;
+    st.err = req->err;
+    st.result_len = req->result_len;
+    release(&aisvc.lock); // fill status
+
+    if (copyout(p->pagetable, st_uva, (char *)&st, sizeof(st)) < 0) {
+        return -1;
+    } // copyout out status to st_uva
+    return 0;
 }
 
 int ai_service_wait(int reqid, uint64 out_uva, int out_cap) {
@@ -408,8 +573,47 @@ int ai_service_wait(int reqid, uint64 out_uva, int out_cap) {
      * 6. Recycle the request slot back to UNUSED after one successful wait.
      * 7. Make a second wait on the same reqid fail instead of returning stale data.
      */
-    (void)out_uva;
-    return -1;
+    char result[AI_MAX_RESULT + 1];
+    int result_len = 0;
+    memset(result, 0, sizeof(result));
+
+    acquire(&aisvc.lock);
+
+    struct ai_request *req = ai_find_req_locked(reqid, p->pid); // find req
+    if (req == 0) {
+        release(&aisvc.lock);
+        return -1;
+    }
+
+    while (ai_req_busy(req)) {
+        sleep(req, &aisvc.lock);
+    } // sleep while req is busy
+
+    if (req->state != AIREQ_DONE) {
+        release(&aisvc.lock);
+        return -1;
+    } // reject failed req
+
+    result_len = req->result_len;
+    if (result_len < 0 || result_len > AI_MAX_RESULT || result_len + 1 > out_cap) {
+        release(&aisvc.lock);
+        return -1;
+    }
+    memmove(result, req->result, (uint64)result_len + 1); // copy req->result into kernal buffer
+    release(&aisvc.lock);
+
+    if (copyout(p->pagetable, out_uva, result, (uint64)result_len + 1) < 0) {
+        return -1;
+    } // copyout result to out_uva
+
+    acquire(&aisvc.lock);
+    req = ai_find_req_locked(reqid, p->pid);
+    if (req != 0 && req->state == AIREQ_DONE) {
+        ai_req_reset(req);
+        wakeup(&aisvc);
+    }
+    release(&aisvc.lock);
+    return result_len;
 }
 
 int ai_service_call(uint64 token_uva, int token_count, int predict_count, uint64 out_uva, int out_cap) {
