@@ -302,7 +302,6 @@ int ai_service_worker_register(void) {
     if (aisvc.worker_online == 0) {
         aisvc.worker_pid = p->pid;
         aisvc.worker_online = 1;
-        wakeup(&aisvc.qcount);
         release(&aisvc.lock);
         return 0;
     } //first time register
@@ -338,13 +337,11 @@ int ai_service_worker_get(uint64 token_uva, int token_cap, uint64 reqid_uva, uin
      * 8. If any copyout fails, transition the request to FAILED and wake waiters.
      * 9. Return token_count on success.
      */
-
-    while (true) {
-        if (!aisvc.worker_online || p->pid != aisvc.worker_pid) {
-            release(&aisvc.lock);
-            return -1;
-        } // check the caller is registered worker
-        if (aisvc.qcount > 0) break;
+    if (!aisvc.worker_online || p->pid != aisvc.worker_pid) {
+        release(&aisvc.lock);
+        return -1;
+    } // check the caller is registered worker
+    while (aisvc.qcount <= 0) {
         sleep(&aisvc.qcount, &aisvc.lock);  // sleep while queue is empty
     }
 
@@ -468,7 +465,7 @@ int ai_service_worker_complete(int reqid, uint64 out_uva, int out_len, int statu
         req2->state = AIREQ_FAILED;
         wakeup(req2);
         release(&aisvc.lock);
-        return -1;
+        return 0;
     } // previous fail
 
     req2->err = 0;
