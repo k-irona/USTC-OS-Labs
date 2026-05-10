@@ -627,70 +627,9 @@ int ai_service_call(uint64 token_uva, int token_count, int predict_count, uint64
      *     if (reqid < 0) return -1;
      *     return ai_service_wait(reqid, out_uva, out_cap);
      */
-    struct proc *p = myproc();
-    if (p == 0 || p->pagetable == 0 || out_uva == 0) {
+    int reqid = ai_service_submit(token_uva, token_count, predict_count);
+    if (reqid < 0) {
         return -1;
     }
-    if (token_count <= 0 || token_count > AI_MAX_TOKENS || predict_count <= 0 || predict_count > AI_MAX_PREDICT ||
-        out_cap <= 0 || out_cap > AI_MAX_RESULT + 1) {
-        return -1;
-    }
-
-    uint32 tokens[AI_MAX_TOKENS];
-    char result[AI_MAX_RESULT + 1];
-    memset(tokens, 0, sizeof(tokens));
-    memset(result, 0, sizeof(result));
-
-    if (copyin(p->pagetable, (char *)tokens, token_uva, (uint64)token_count * sizeof(uint32)) < 0) {
-        return -1;
-    }
-
-    acquire(&aisvc.lock);
-    struct ai_request *req = ai_find_slot_locked();
-    if (req == 0) {
-        release(&aisvc.lock);
-        return -1;
-    }
-
-    req->id = aisvc.next_id++;
-    req->owner_pid = p->pid;
-    req->state = AIREQ_NEW;
-    req->err = 0;
-    req->token_count = token_count;
-    req->predict_count = predict_count;
-    req->result_len = 0;
-    memmove(req->tokens, tokens, (uint64)token_count * sizeof(uint32));
-    req->state = AIREQ_READY;
-    req->state = AIREQ_RUNNING;
-    release(&aisvc.lock);
-
-    int n = ai_sync_smoke_placeholder(req->tokens, req->token_count, req->predict_count, result, out_cap);
-
-    acquire(&aisvc.lock);
-    if (n < 0 || n > AI_MAX_RESULT) {
-        req->err = -1;
-        req->result_len = 0;
-        req->state = AIREQ_FAILED;
-        ai_req_reset(req);
-        release(&aisvc.lock);
-        return -1;
-    }
-
-    req->err = 0;
-    req->result_len = n;
-    memmove(req->result, result, (uint64)n + 1);
-    req->state = AIREQ_DONE;
-    release(&aisvc.lock);
-
-    if (copyout(p->pagetable, out_uva, result, (uint64)n + 1) < 0) {
-        acquire(&aisvc.lock);
-        ai_req_reset(req);
-        release(&aisvc.lock);
-        return -1;
-    }
-
-    acquire(&aisvc.lock);
-    ai_req_reset(req);
-    release(&aisvc.lock);
-    return n;
+    return ai_service_wait(reqid, out_uva, out_cap);
 }

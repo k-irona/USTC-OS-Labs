@@ -74,11 +74,24 @@ static int prefix_cache_plan_copy(
      * 4. 计算要复制的 prefix 元素数 prefix_elems = prefix_len * elems_per_pos。
      * 5. 通过 out 指针把 layer_span / prefix_elems 返回，并返回修正后的 prefix_len。
      */
-    (void)cfg;
-    (void)prefix_len;
-    (void)layer_span_out;
-    (void)prefix_elems_out;
-    return 0;
+    if (cfg == NULL || layer_span_out == NULL || prefix_elems_out == NULL) {
+        return 0;
+    }
+
+    if (prefix_len < 0) {
+        prefix_len = 0;
+    }
+    if (prefix_len > cfg->runtime_seq_len) {
+        prefix_len = cfg->runtime_seq_len;
+    }
+
+    uint64 elems_per_pos = (uint64)cfg->n_kv_heads * (uint64)cfg->head_dim;
+    uint64 layer_span = (uint64)cfg->runtime_seq_len * elems_per_pos;
+    uint64 prefix_elems = (uint64)prefix_len * elems_per_pos;
+
+    *layer_span_out = layer_span;
+    *prefix_elems_out = prefix_elems;
+    return prefix_len;
 }
 
 static void __attribute__((unused))
@@ -100,8 +113,11 @@ prefix_cache_copy_prefix_slice(float *dst, const float *src, const struct model_
      * - 只复制 prefix_elems 个 float；
      * - 不要把整层 runtime_seq_len 都复制过去。
      */
-    (void)layer_span;
-    (void)prefix_elems;
+    for (int l = 0; l < cfg->n_layers; l++) {
+        const float *s = src + (uint64)l * prefix_elems;
+        float *d = dst + (uint64)l * layer_span;
+        memcpy(d, s, (uint)(prefix_elems * sizeof(float)));
+    }
 }
 
 static void __attribute__((unused)) clear_kv_cache_from(float *cache, const struct model_cfg *cfg, int start_pos) {
@@ -231,15 +247,28 @@ static int prefix_cache_try_restore(struct daemon_runtime *dr, int token_count, 
      *
      * 建议优先复用上面的 prefix_cache_copy_prefix_slice() 和 clear_kv_cache_from()。
      */
-    (void)dr;
-    (void)resume_pos_out;
+    const struct model_cfg *cfg = &dr->rt.cfg;
 
-    /*
-     * 当前 start code 故意不执行真正的恢复逻辑；
-     * 即使检测到可复用前缀，也会安全回退到冷启动路径。
-     */
-    pc->misses++;
-    return 0;
+    /* copy prompt tokens back into runtime seq */
+    for (int i = 0; i < token_count; i++) {
+        dr->rt.seq[i] = dr->rt.prompt[i];
+    }
+
+    /* restore cached K/V prefix slices into runtime caches */
+    prefix_cache_copy_prefix_slice(dr->kcache, pc->cached_kcache, cfg, reuse_len);
+    prefix_cache_copy_prefix_slice(dr->vcache, pc->cached_vcache, cfg, reuse_len);
+
+    /* clear any tail positions after reused prefix to avoid leakage */
+    clear_kv_cache_from(dr->kcache, cfg, reuse_len);
+    clear_kv_cache_from(dr->vcache, cfg, reuse_len);
+
+    pc->restores++;
+    pc->hits++;
+
+    if (resume_pos_out != 0) {
+        *resume_pos_out = reuse_len;
+    }
+    return reuse_len;
 }
 
 static void prefix_cache_save_after_prefill(struct daemon_runtime *dr) {
@@ -278,7 +307,26 @@ static void prefix_cache_save_after_prefill(struct daemon_runtime *dr) {
      * 当前框架已经把 snapshot 的保存时机放在 prompt prefill 结束之后了，
      * 你只需要补全具体的 KV 拷贝逻辑即可。
      */
-    (void)dr;
+    if (dr == NULL) {
+        return;
+    }
+
+    const struct model_cfg *cfg = &dr->rt.cfg;
+    uint64 layer_span = 0;
+    uint64 prefix_elems = 0;
+    int actual_prefix = prefix_cache_plan_copy(cfg, save_prefix_len, &layer_span, &prefix_elems);
+    if (actual_prefix <= 0) {
+        return;
+    }
+
+    for (int l = 0; l < cfg->n_layers; l++) {
+        const float *s_k = dr->kcache + (uint64)l * layer_span;
+        const float *s_v = dr->vcache + (uint64)l * layer_span;
+        float *d_k = pc->cached_kcache + (uint64)l * prefix_elems;
+        float *d_v = pc->cached_vcache + (uint64)l * prefix_elems;
+        memcpy(d_k, s_k, (uint)(prefix_elems * sizeof(float)));
+        memcpy(d_v, s_v, (uint)(prefix_elems * sizeof(float)));
+    }
 
     /*
      * 背后的原因是：如果等完整冷启动 decode 结束后再保存，
@@ -688,7 +736,16 @@ static int handle_request(struct daemon_runtime *dr, const uint32 *tokens, int t
     if (llm_runtime_set_request(&dr->rt, (uint32 *)tokens, token_count, 0, predict_count) < 0) {
         return -1;
     }
-    return run_decode(dr, out, out_cap);
+    int n = run_decode(dr, out, out_cap);
+    LLM_LOG("prefix_cache: valid=%d prefix_len=%d hits=%u misses=%u restores=%u saves=%u bypasses=%u\n",
+            dr->prefix_cache.valid,
+            dr->prefix_cache.cached_prefix_len,
+            dr->prefix_cache.hits,
+            dr->prefix_cache.misses,
+            dr->prefix_cache.restores,
+            dr->prefix_cache.saves,
+            dr->prefix_cache.bypasses);
+    return n;
 }
 
 static int parse_ready_fd(int argc, char *argv[]) {
