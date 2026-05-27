@@ -129,21 +129,21 @@ void usertrap(void) {
             int handled = 0;
 #if COW_ALLOC
             if (code == STORE_PAGE_FAULT) {
-                // TODO: Detect and resolve writes to COW pages.
-                //
-                // Only a real COW store fault should be handled here. Other
-                // page faults must fall through to the lazy/mmap handler below.
-                // If COW handling fails, mark this process as killed.
-            }
+                if (cow_handle_fault(p->pagetable, fault_va) == 0) {
+                    handled = 1;
+                }
+            } // try COW handle first
 #endif
 
             if (!handled) {
-                // TODO: Dispatch remaining valid lazy/mmap faults to proc.c.
-                //
-                // Invalid addresses and protection faults should kill only the
-                // faulting process, not panic the kernel.
-                (void) fault_va;
-            }
+                if (proc_handle_page_fault(fault_va, code == STORE_PAGE_FAULT) == 0) {
+                    handled = 1;
+                }
+            } // if not handled by COW
+
+            if (!handled) {
+                p->killed = 1;
+            } // unable to fix, kill the process
         } else {
             printf("[usertrap] scause=%p sepc=%p stval=%p\n", scause, r_sepc(), r_stval());
             p->killed = 1;

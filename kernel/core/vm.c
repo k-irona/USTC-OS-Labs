@@ -113,48 +113,62 @@ uint64 walkaddr(pagetable_t pagetable, uint64 va) {
 }
 
 static int should_lazy_alloc(struct proc *p, pagetable_t pagetable, uint64 va) {
-    (void) p;
-    (void) pagetable;
-    (void) va;
-    // TODO: [Lazy-allocation] Decide whether va is a valid lazy-allocation fault.
-    // A valid lazy page should:
-    // - belong to the process's logical address space
-    // - stay below the reserved top-of-user-space region
-    // - not overlap the user stack guard page
-    // - not already have a valid mapping
-    //
-    // Return 1 if the kernel should allocate a zero-filled page for va.
-    // Return 0 if the fault should be treated as invalid.
-    return 0;
+    if (p == 0 || pagetable == 0 || p->trapframe == 0) {
+        return 0;
+    } // invalid p
+
+    if (va >= MAXVA || va >= p->sz || va >= proc_mmap_limit(p)) {
+        return 0;
+    }
+    uint64 guard = PGROUNDDOWN(p->trapframe->sp - 1) - PGSIZE;
+    if (va == guard) {
+        return 0;
+    } // invalid address
+
+    pte_t *pte = walk(pagetable, va, 0);
+    if (pte != 0 && (*pte & PTE_V)) {
+        return 0;
+    } // exist valid PTE
+    return 1;
 }
 
 int user_lazy_alloc(struct proc *p, pagetable_t pagetable, uint64 va) {
     uint64 page = PGROUNDDOWN(va);
     if (!should_lazy_alloc(p, pagetable, page)) {
         return -1;
+    } // invalid lazy allocation
+    void *mem = kalloc(); // allocate physical page
+    if (mem == 0) {
+        return -1;
     }
-    // TODO: [Lazy-allocation] Allocate one physical page for this lazy fault.
-    //
-    // Requirements:
-    // - expose zero-filled memory to user space
-    // - map exactly the faulting virtual page
-    // - give the mapping user read/write permissions
-    // - release any temporary resources on failure
-
-    return -1;
+    memset(mem, 0, PGSIZE); // initialize
+    if (mappages(pagetable, page, PGSIZE, (uint64)mem, PTE_R | PTE_W | PTE_U) != 0) {
+        kfree(mem); // release any temporary resources on failure
+        return -1;
+    } // map page and give permissions
+    return 0;
 }
 
 
 extern int lazy_alloc_enabled;
 static uint64 lazy_alloc_walkaddr(pagetable_t pagetable, uint64 va, int write) {
-    (void) write;
-    // TODO: [Lazy-allocation] Support kernel-side access to untouched lazy pages.
-    //
-    // walkaddr() succeeds only if the page is already mapped. If it fails,
-    // a valid lazy page should be allocated on demand, then walkaddr() should
-    // be retried.
+    uint64 pa = walkaddr(pagetable, va);
+    if (pa != 0 || !lazy_alloc_enabled) {
+        return pa;
+    } // walkaddr succeed
 
-    return walkaddr(pagetable, va);
+    struct proc *p = myproc();
+    if (p == 0 || p->pagetable != pagetable) {
+        return 0;
+    }
+    if (user_lazy_alloc(p, pagetable, va) < 0) {
+        return 0;
+    } // lazy allocation
+    pa = walkaddr(pagetable, va);
+    if (pa == 0) {
+        return 0;
+    }
+    return pa;
 }
 
 // Create PTEs for virtual addresses starting at va that refer to
@@ -323,21 +337,19 @@ int uvmcopy(pagetable_t old, pagetable_t new, uint64 sz) {
 
 // If COW_ALLOC is enabled, fork should avoid unnecessary physical-page copies.
 #if COW_ALLOC
-        // TODO: [COW] Replace this eager-copy fallback with copy-on-write fork.
-        //
-        // Preserve parent/child isolation without copying every writable page
-        // immediately. Read-only pages and writable pages need different
-        // treatment, and shared physical pages need ownership metadata.
-        //
-        // This fallback keeps fork functional, but it is not COW.
-        void *mem = kalloc();
-        if (mem == 0) {
-            goto err;
-        }
-        memmove(mem, (void *)pa, PGSIZE);
-        if (mappages(new, i, PGSIZE, (uint64)mem, flags) != 0) {
-            kfree(mem);
-            goto err;
+        kaddref((void *)pa);
+        if ((flags & PTE_W) || (flags & PTE_COW)) {
+            uint cow_flags = (flags | PTE_COW) & ~PTE_W;
+            *pte = PA2PTE(pa) | cow_flags;
+            if (mappages(new, i, PGSIZE, pa, cow_flags) != 0) {
+                kfree((void *)pa);
+                goto err;
+            }
+        } // clear PTE_W and set PTE_COW
+        else {
+            if (mappages(new, i, PGSIZE, pa, flags) != 0) {
+                goto err;
+            }
         }
 #else
         // Eager copy: allocate new page and copy data.
@@ -407,21 +419,30 @@ void uvmclear(pagetable_t pagetable, uint64 va) {
 // [COW] Handle a write fault by either restoring write permission when
 // this process is the only owner, or copying data into a private page.
 int cow_handle_fault(pagetable_t pagetable, uint64 va) {
-    (void) pagetable;
-    (void) va;
-    // TODO: [COW] Resolve a write fault on a copy-on-write page.
-    //
-    // Requirements:
-    // - reject faults that are not real COW faults
-    // - preserve the old page contents
-    // - give the faulting process a writable private mapping when needed
-    // - avoid unnecessary copying when the page is no longer shared
-    // - update physical-page ownership metadata correctly
-    //
-    // Return 0 on success, -1 on invalid fault or allocation failure.
+    uint64 page = PGROUNDDOWN(va);
+    pte_t *pte = walk(pagetable, page, 0);
+    if (pte == 0 || (*pte & PTE_V) == 0 || (*pte & PTE_U) == 0) {
+        return -1;
+    }
+    if ((*pte & PTE_COW) == 0 || (*pte & PTE_W) != 0) {
+        return -1;
+    } // check PTE labels
 
+    uint64 pa = PTE2PA(*pte);
+    uint flags = (uint)PTE_FLAGS(*pte);
+    if (kgetref((void *)pa) == 1) {
+        *pte = PA2PTE(pa) | ((flags | PTE_W) & ~PTE_COW);
+        return 0;
+    } // don't need to copy
 
-    return -1;
+    void *mem = kalloc();
+    if (mem == 0) {
+        return -1;
+    }
+    memmove(mem, (void *)pa, PGSIZE); // copy to new page
+    *pte = PA2PTE(mem) | ((flags | PTE_W) & ~PTE_COW);
+    kfree((void *)pa); // child don't need oldpa
+    return 0;
 }
 #endif
 
@@ -443,12 +464,16 @@ int copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len) {
             return -1;
         }
 #if COW_ALLOC
-        // TODO: [COW] Kernel writes to user memory must also respect COW.
-        //
-        // If the destination page is a COW mapping, resolve it before writing
-        // through pa0. The physical page used for the final memmove() must be
-        // the current private writable page.
-
+        if ((*pte & PTE_COW) != 0) { // COW page
+            if (cow_handle_fault(pagetable, va0) < 0) {
+                return -1;
+            }
+            pa0 = walkaddr(pagetable, va0);
+            pte = walk(pagetable, va0, 0);
+            if (pa0 == 0 || pte == 0) {
+                return -1;
+            } // reget pa & pte
+        }
 #endif
         if ((*pte & PTE_W) == 0) {
             return -1;

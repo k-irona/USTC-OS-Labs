@@ -103,28 +103,23 @@ static uint64 sys_sbrk(void) {
     uint64 addr = p->sz;
 
     if (lazy_alloc_enabled && n > 0) {
-        // TODO: Implement lazy-growth sbrk.
-        //
-        // Reserve virtual address space without allocating physical pages.
-        // Validate the new size against the same user-space limit used by the
-        // eager path, then update p->sz only after validation succeeds.
-        // Temporary fallback: keep sbrk functional, but this is eager and will
-        // not pass the lazy-allocation tests.
+        uint64 newsz = addr + (uint64)n;
+        if (newsz < addr || newsz > proc_mmap_limit(p)) {
+            return (uint64)-1;
+        }
+        p->sz = newsz;
+    } // lazy allocation
+    else if (n < 0) {
+        int64 newsz = (int64)addr + (int64)n;
+        if (newsz < 0) {
+            return (uint64)-1;
+        }
+        p->sz = uvmdealloc(p->pagetable, addr, (uint64)newsz);
+    } // shrink
+    else {
         if (growproc(n) < 0)
             return (uint64)-1;
-    } else if (n < 0) {
-        // TODO: Implement shrinking.
-        //
-        // Shrinking is not lazy: pages above the new logical size should be
-        // released immediately, including ranges that may contain lazy holes.
-        //
-        // Temporary stub: fail gracefully until this path is implemented.
-        return (uint64)-1;
-    } else {
-        // Eager allocation : allocate physical memory now.
-        if (growproc(n) < 0)
-            return (uint64)-1;
-    }
+    } // eager allocation
     return addr;
 }
 

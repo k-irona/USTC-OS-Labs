@@ -28,21 +28,23 @@ static struct {
 static struct spinlock ref_lock;
 static int ref_cnt[PHYSTOP / PGSIZE];
 
+static int pa_index(void *pa) {
+    return (int)((uint64)pa / PGSIZE);
+}
+
 // Increase the reference count for a physical page.
 void kaddref(void *pa) {
-    (void)pa;
-    // TODO: [COW] Record one additional owner of this physical page.
-    // Concurrent fork/exit paths must not race with this metadata update.
-
+    acquire(&ref_lock);
+    ref_cnt[pa_index(pa)]++;
+    release(&ref_lock);
 }
 
 // Get the reference count for a physical page.
 int kgetref(void *pa) {
-    (void)pa;
-    // TODO: [COW] Return how many address-space mappings still own this page.
-    // The COW fault path uses this to decide whether copying is necessary.
-
-    return 1;
+    acquire(&ref_lock);
+    int n = ref_cnt[pa_index(pa)];
+    release(&ref_lock);
+    return n;
 }
 #else
 // Stubs when COW is disabled.
@@ -60,10 +62,18 @@ void kfree(void *pa) {
     }
 
 #if COW_ALLOC
-    // TODO: [COW] Release one owner of this physical page.
-    // A page that is still shared must not be returned to the freelist. Only
-    // the last release should continue to the normal free path below.
-
+    acquire(&ref_lock);
+    int idx = pa_index(pa);
+    if (ref_cnt[idx] < 1) {
+        release(&ref_lock);
+        panic("kfree: ref");
+    }
+    ref_cnt[idx]--;
+    int refs = ref_cnt[idx];
+    release(&ref_lock);
+    if (refs > 0) {
+        return;
+    } // only the last release continue to the normal free path below
 #endif
 
     // Fill with junk to catch dangling refs.
@@ -92,6 +102,9 @@ void kinit(void) {
     // Free every page after the kernel.
     uint64 p = PGROUNDUP((uint64)end);
     for (; p + PGSIZE <= PHYSTOP; p += PGSIZE) {
+#if COW_ALLOC
+        ref_cnt[pa_index((void *)p)] = 1;
+#endif //avoid panic
         kfree((void *)p);
     }
 }
@@ -108,8 +121,9 @@ void *kalloc(void) {
         // Fill with junk to help spot uninitialized use.
         memset((void *)r, 5, PGSIZE);
 #if COW_ALLOC
-        // TODO: [COW] A freshly allocated physical page starts with one owner.
-
+        acquire(&ref_lock);
+        ref_cnt[pa_index((void *)r)] = 1;
+        release(&ref_lock);
 #endif
         LOG_DEBUG("Allocated physical page at %p", r); // [埋点]
     } else {

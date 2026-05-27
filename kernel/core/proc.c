@@ -137,9 +137,10 @@ int proc_handle_page_fault(uint64 fault_va, int write) {
     }
 
     if (lazy_alloc_enabled) {
-        // TODO:[Lazy allocation]: try zero-fill-on-demand heap allocation before
-        // treating the fault as an invalid access, you should call user_lazy_alloc() to attempt to handle this page fault via lazy allocation.
-    }
+        if (user_lazy_alloc(p, p->pagetable, va) == 0) {
+            return 0;
+        }
+    } // try lazy allocation
 
     struct vma *vma = vma_lookup(p, va);
     if (vma == 0) {
