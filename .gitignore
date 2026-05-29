@@ -11,3 +11,5 @@ compiler_commands.json
 fs.img
 __pycache__/
 *.pyc
+compile_commands.json
+.compdb/
