@@ -177,6 +177,7 @@ UPROGS = \
 	kwset \
 	kwget \
 	query \
+	bonusbench \
 	lab4test \
 	rscr \
 
@@ -281,6 +282,8 @@ FSIMG_ADDS = \
 	--add kwset=$(UBUILD)/kwset.elf \
 	--add kwget=$(UBUILD)/kwget.elf \
 	--add query=$(UBUILD)/query.elf \
+	--add bonusbench=$(UBUILD)/bonusbench.elf \
+	--add bonus.sh=user/bonus.sh \
 	--add lab4test=$(UBUILD)/lab4test.elf \
 	--add rscr=$(UBUILD)/rscr.elf \
 

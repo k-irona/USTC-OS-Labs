@@ -170,13 +170,7 @@ static uint fat16_cluster_first_sector(uint cluster) {
      * 请根据 meta.data_sec、meta.sec_per_clus 和 FAT16_CLUSTER_MIN 计算 cluster 的首扇区
      */
     /* LAB TODO [1.1] BEGIN */
-    
-    panic("fat16_cluster_first_sector: not implemented");
-
-    uint first_sector = 0;
-
-
-    return first_sector;
+    return meta.data_sec + (cluster - FAT16_CLUSTER_MIN) * meta.sec_per_clus;
 
     /* LAB TODO [1.1] END */
 }
@@ -359,15 +353,12 @@ static uint fat16_read_fat(uint cluster) {
      * 请使用bread()读取FAT表并解析出FAT[cluster]的值
      */
     /* LAB TODO [1.1] BEGIN */
-
-    panic("fat16_read_fat: not implemented");
-
-    uint fat_value = 0;
-
-
-
-    
-
+    uint byteoff = cluster * 2;
+    uint sector = meta.fat_sec + byteoff / BSIZE;
+    uint off = byteoff % BSIZE;
+    struct buf *bp = bread(meta.dev, sector);
+    uint fat_value = get16(bp->data + off);
+    brelse(bp);
     return fat_value;
     /* LAB TODO [1.1] END */
 }
@@ -519,18 +510,17 @@ static int fat16_slot_by_index(struct inode *dp, uint index, struct fat16_slot *
      * 提示：普通子目录分支在下面，它需要走簇链；根目录分支不需要读FAT表。
      */
     /* LAB TODO [1.2] BEGIN */
-
-    panic("fat16_slot_by_index: not implemented");
-
     // 请在以下 if 块中实现根目录的目录项定位
     if (dp->inum == FAT16_ROOT_INUM || dp->addrs[0] == 0) {
-    
-
-
-
-
-
-
+        if (index >= meta.root_entries) {
+            return -1;
+        }
+        uint entry_byte_offset = index * FAT16_DIR_ENTRY_SIZE;
+        slot->sector = meta.root_sec + entry_byte_offset / BSIZE;
+        slot->offset = entry_byte_offset % BSIZE;
+        slot->index = index;
+        fat16_read_entry(slot->sector, slot->offset, &slot->entry);
+        return 0;
     }
 
     /* LAB TODO [1.2] END */
@@ -763,16 +753,16 @@ void fat16fs_fsinit(int dev) {
 
     // !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
-    panic("fat16fs_fsinit: not implemented"); 
-
-
-
-
-
-
-
-
-
+    meta.bytes_per_sec = get16(d + 0x0b);
+    meta.sec_per_clus = d[0x0d];
+    meta.reserved = get16(d + 0x0e);
+    meta.fats = d[0x10];
+    meta.root_entries = get16(d + 0x11);
+    meta.total_sec = get16(d + 0x13);
+    if (meta.total_sec == 0) {
+        meta.total_sec = get32(d + 0x20);
+    }
+    meta.sec_per_fat = get16(d + 0x16);
     /* LAB TODO [1.1] END: read BPB fields */
 
     ushort sig = get16(d + 510);
@@ -790,16 +780,13 @@ void fat16fs_fsinit(int dev) {
      */
     /* LAB TODO [1.1] BEGIN: compute FAT16 regions */
 
-    panic("fat16fs_fsinit: not implemented");
-
-
-
-
-
-
-
-
-
+    meta.fat_sec = meta.reserved;
+    meta.root_sectors =
+        (meta.root_entries * FAT16_DIR_ENTRY_SIZE + meta.bytes_per_sec - 1) / meta.bytes_per_sec;
+    meta.root_sec = meta.fat_sec + meta.fats * meta.sec_per_fat;
+    meta.data_sec = meta.root_sec + meta.root_sectors;
+    meta.clusters = (meta.total_sec - meta.data_sec) / meta.sec_per_clus;
+    meta.cluster_size = meta.bytes_per_sec * meta.sec_per_clus;
     /* LAB TODO [1.1] END: compute FAT16 regions */
 
     printf("[fat16fs] mounted: sectors=%d clusters=%d spc=%d root=%d data=%d\n",
@@ -995,20 +982,23 @@ static int fat16_cluster_for_offset(struct inode *ip, uint off, int alloc, uint 
      * 如果alloc不为0，则需要分配新簇接到链尾继续走，直到走到目标簇
      */
     /* LAB TODO [1.3] BEGIN: walk or grow FAT chain */
+    for (uint i = 0; i < cluster_index; i++) {
+        uint next_cluster = fat16_read_fat(current_cluster);
+        if (fat16_fat_value_is_eoc(next_cluster) || !fat16_cluster_inuse(next_cluster)) {
+            if (!alloc) {
+                return -1;
+            }
+            uint new_cluster = 0;
+            if (fat16_alloc_cluster(&new_cluster) < 0) {
+                return -1;
+            }
+            fat16_write_fat(current_cluster, new_cluster);
+            next_cluster = new_cluster;
+        }
+        current_cluster = next_cluster;
+    }
 
-    panic("fat16_cluster_for_offset: not implemented");
-
-
-
-
-
-
-
-
-
-
-
-
+    *cluster_out = current_cluster;
     return 0;
     /* LAB TODO [1.3] END: walk or grow FAT chain */
 }
@@ -1079,19 +1069,23 @@ int fat16fs_readi(struct inode *ip, uint64 off, void *dst, uint n) {
      */
     /* LAB TODO [1.3] BEGIN */
 
-    panic("fat16fs_readi: not implemented");
-
     uint copied = 0;
-
-
-
-
-
-
-
-
-
-
+    uchar *dst_bytes = (uchar *)dst;
+    while (copied < n) {
+        uint position = (uint)off + copied;
+        uint cluster = 0;
+        if (fat16_cluster_for_offset(ip, position, 0, &cluster) < 0) {
+            break;
+        }
+        uint cluster_off = position % meta.cluster_size;
+        uint sector = fat16_cluster_first_sector(cluster) + cluster_off / BSIZE;
+        uint sector_off = cluster_off % BSIZE;
+        uint copy_bytes = min_uint(n - copied, BSIZE - sector_off);
+        struct buf *bp = bread(ip->dev, sector);
+        memmove(dst_bytes + copied, bp->data + sector_off, copy_bytes);
+        brelse(bp);
+        copied += copy_bytes;
+    }
     /* LAB TODO [1.3] END */
 
     if (need_unlock) {
@@ -1163,29 +1157,33 @@ int fat16fs_writei(struct inode *ip, uint64 off, const void *src, uint n) {
      */
     /* LAB TODO [1.4] BEGIN: write data */
 
-    panic("fat16fs_writei: not implemented");
-
     uint copied = 0;
-
-
-
-
-
-
-
-
-
+    const uchar *src_bytes = (const uchar *)src;
+    while (copied < n) {
+        uint position = (uint)off + copied;
+        uint cluster = 0;
+        if (fat16_cluster_for_offset(ip, position, 1, &cluster) < 0) {
+            break;
+        }
+        uint cluster_off = position % meta.cluster_size;
+        uint sector = fat16_cluster_first_sector(cluster) + cluster_off / BSIZE;
+        uint sector_off = cluster_off % BSIZE;
+        uint copy_bytes = min_uint(n - copied, BSIZE - sector_off);
+        struct buf *bp = bread(ip->dev, sector);
+        memmove(bp->data + sector_off, src_bytes + copied, copy_bytes);
+        bwrite(bp);
+        brelse(bp);
+        copied += copy_bytes;
+    }
 
     /* LAB TODO [1.4] END: write data */
 
     /* LAB TODO [1.4] BEGIN: update file size */
-
-    
-
-
-
-
-
+    uint end = (uint)off + copied;
+    if (end > ip->size) {
+        ip->size = end;
+        fat16fs_iupdate(ip);
+    }
     /* LAB TODO [1.4] END: update file size */
     if (need_unlock) {
         fat16fs_iunlock(ip);
@@ -1576,14 +1574,16 @@ static int fat16_keyword_count_before(struct inode *dp, uint std_index) {
      */
     int count = 0;
     /* LAB TODO [2.1] BEGIN */
-
-
-
-
-
-
-
-
+    while (count < FAT16_KW_MAX_ENTRIES && std_index > (uint)count) {
+        struct fat16_slot slot;
+        if (fat16_slot_by_index(dp, std_index - (uint)count - 1, &slot) < 0) {
+            break;
+        }
+        if (!fat16_dirent_is_keyword(&slot.entry)) {
+            break;
+        }
+        count++;
+    }
     /* LAB TODO [2.1] END */
     return count;
 }
@@ -1664,19 +1664,29 @@ static int fat16_find_free_run(struct inode *dp, uint need, uint old_start, uint
         uint start = 0;
 
         // 实现查找长度为 need 的连续可用槽位
+        for (uint i = 0; i < nslot; i++) {
+            if (fat16_slot_available_for_run(dp, i, old_start, old_count)) {
+                if (run == 0) {
+                    start = i;
+                }
+                run++;
+                if (run == need) {
+                    if (fat16_slot_by_index(dp, start, first_slot) < 0) {
+                        return -1;
+                    }
+                    if (first_index) {
+                        *first_index = start;
+                    }
+                    return 0;
+                }
+            } else {
+                run = 0;
+            }
+        }
 
-
-
-
-
-
-
-
-
-
-        // if (在这里填写需要增长目录时出现错误的判断条件) {
-        //     return -1;
-        // }
+        if (dp->inum == FAT16_ROOT_INUM || dp->addrs[0] == 0 || fat16_grow_dir(dp) < 0) {
+            return -1;
+        }
     }
     /* LAB TODO [2.2] END */
 }
@@ -1737,6 +1747,29 @@ static int fat16_read_keywords_before(struct inode *dp, uint std_index, char *bu
      */
     /* LAB TODO [2.1] BEGIN */
     int out = 0; // out是字符串的长度，不含末尾 '\0'
+    uint start = std_index - (uint)count;
+    for (int i = 0; i < count; i++) {
+        struct fat16_slot slot;
+        if (fat16_slot_by_index(dp, start + (uint)i, &slot) < 0) {
+            return -1;
+        }
+        for (int j = 0; j < FAT16_KW_BYTES_PER_ENTRY; j++) {
+            uchar byte = fat16_kw_get_data_byte(&slot.entry, j);
+            if (byte == 0) {
+                buf[out] = 0;
+                return out;
+            }
+            if (out >= max - 1) {
+                return -1;
+            }
+            buf[out++] = (char)byte;
+        }
+    }
+
+    if (out >= max) {
+        return -1;
+    }
+    buf[out] = 0;
 
 
 
@@ -1895,14 +1928,14 @@ int fat16fs_set_keywords(const char *path, const char *keywords) {
     // !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
     if (new_count == 0) {
-        
-
-
-
-
-
-
-
+        fat16_mark_range_deleted_except(dp, old_start, old_total, old_std_index, 1);
+        fat16_kw_index_update_file(old_sector, old_offset, old_sector, old_offset,
+                                   path, old_keywords, keywords);
+        if (need_unlock) {
+            fat16fs_iunlock(dp);
+        }
+        fat16fs_iput(dp);
+        return 0;
     }
 
     /* LAB TODO [2.2] END: clear keywords */
@@ -1917,22 +1950,22 @@ int fat16fs_set_keywords(const char *path, const char *keywords) {
     /* LAB TODO [2.2] BEGIN: reuse old keyword range */
 
     if (new_count <= old_count) {
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+        uint new_start = old_std_index - (uint)new_count;
+        if (fat16_write_keywords_at(dp, new_start, keywords, new_count) < 0) {
+            if (need_unlock) {
+                fat16fs_iunlock(dp);
+            }
+            fat16fs_iput(dp);
+            return -1;
+        }
+        fat16_mark_range_deleted_except(dp, old_start, old_total, new_start, (uint)new_count + 1);
+        fat16_kw_index_update_file(old_sector, old_offset, old_sector, old_offset,
+                                   path, old_keywords, keywords);
+        if (need_unlock) {
+            fat16fs_iunlock(dp);
+        }
+        fat16fs_iput(dp);
+        return 0;
     }
 
     /* LAB TODO [2.2] END: reuse old keyword range */
@@ -1946,40 +1979,54 @@ int fat16fs_set_keywords(const char *path, const char *keywords) {
      * 如果这个文件的inode被加载到了itable中，你需要更新itable中的inum、sector、offset等信息。
      */
     /* LAB TODO [2.2] BEGIN: move entry to larger keyword run */
+    uint new_total = (uint)new_count + 1;
+    uint new_start = 0;
+    struct fat16_slot first_slot = {0};
+    if (fat16_find_free_run(dp, new_total, old_start, old_total, &first_slot, &new_start) < 0) {
+        if (need_unlock) {
+            fat16fs_iunlock(dp);
+        }
+        fat16fs_iput(dp);
+        return -1;
+    }
+    if (fat16_write_keywords_at(dp, new_start, keywords, new_count) < 0) {
+        if (need_unlock) {
+            fat16fs_iunlock(dp);
+        }
+        fat16fs_iput(dp);
+        return -1;
+    }
 
+    uint new_std_index = new_start + (uint)new_count;
+    struct fat16_slot new_std_slot = {0};
+    if (fat16_slot_by_index(dp, new_std_index, &new_std_slot) < 0) {
+        if (need_unlock) {
+            fat16fs_iunlock(dp);
+        }
+        fat16fs_iput(dp);
+        return -1;
+    }
+    fat16_write_entry(new_std_slot.sector, new_std_slot.offset, &std_slot.entry);
+    fat16_mark_range_deleted_except(dp, old_start, old_total, new_start, new_total);
 
+    uint old_inum = fat16_slot_inum(old_sector, old_offset);
+    uint new_inum = fat16_slot_inum(new_std_slot.sector, new_std_slot.offset);
+    acquire(&itable.lock);
+    struct inode *loaded = fat16_find_loaded(old_inum);
+    if (loaded) {
+        loaded->inum = new_inum;
+        loaded->addrs[1] = new_std_slot.sector;
+        loaded->addrs[2] = new_std_slot.offset;
+    }
+    release(&itable.lock);
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+    fat16_kw_index_update_file(old_sector, old_offset, new_std_slot.sector, new_std_slot.offset,
+                               path, old_keywords, keywords);
+    if (need_unlock) {
+        fat16fs_iunlock(dp);
+    }
+    fat16fs_iput(dp);
+    return 0;
 
     /* LAB TODO [2.2] END: move entry to larger keyword run */
     return 0;
